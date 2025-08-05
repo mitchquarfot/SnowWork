@@ -3,24 +3,24 @@
 
 -- Option 1: Create individual secrets (recommended)
 CREATE OR REPLACE SECRET aws_access_key_id
-TYPE = GENERIC
+TYPE = GENERIC_STRING
 SECRET_STRING = 'YOUR_AWS_ACCESS_KEY_ID';
 
 CREATE OR REPLACE SECRET aws_secret_access_key
-TYPE = GENERIC
+TYPE = GENERIC_STRING
 SECRET_STRING = 'YOUR_AWS_SECRET_ACCESS_KEY';
 
 CREATE OR REPLACE SECRET aws_region
-TYPE = GENERIC
+TYPE = GENERIC_STRING
 SECRET_STRING = 'us-west-2';
 
 CREATE OR REPLACE SECRET s3_bucket_name
-TYPE = GENERIC
+TYPE = GENERIC_STRING
 SECRET_STRING = 'your-bucket-name';
 
 -- Option 2: Create a single JSON secret (alternative)
 CREATE OR REPLACE SECRET aws_credentials
-TYPE = GENERIC
+TYPE = GENERIC_STRING
 SECRET_STRING = '{
     "access_key_id": "YOUR_AWS_ACCESS_KEY_ID",
     "secret_access_key": "YOUR_AWS_SECRET_ACCESS_KEY",

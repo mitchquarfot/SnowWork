@@ -1,10 +1,13 @@
 import streamlit as st
-import boto3
-from botocore.exceptions import ClientError, NoCredentialsError
 import requests
 import uuid
 from datetime import datetime
 import os
+import json
+import hashlib
+import hmac
+import urllib.parse
+from urllib.parse import quote
 
 # Load environment variables from .env file for local development
 try:
@@ -31,6 +34,44 @@ def get_aws_credentials():
     except Exception:
         pass
     
+    # Try to get from Snowflake database secrets using SQL
+    try:
+        # This will work when running in Snowflake Streamlit
+        access_key = st.session_state.get('aws_access_key')
+        secret_key = st.session_state.get('aws_secret_key')
+        region = st.session_state.get('aws_region')
+        bucket_name = st.session_state.get('aws_bucket_name')
+        
+        if not access_key:
+            # Try to fetch from Snowflake secrets using SQL
+            conn = st.connection("snowflake")
+            access_key_result = conn.query("SELECT SYSTEM$GET_SECRET_STRING('aws_access_key_id') as secret_value")
+            secret_key_result = conn.query("SELECT SYSTEM$GET_SECRET_STRING('aws_secret_access_key') as secret_value")
+            region_result = conn.query("SELECT SYSTEM$GET_SECRET_STRING('aws_region') as secret_value")
+            bucket_result = conn.query("SELECT SYSTEM$GET_SECRET_STRING('s3_bucket_name') as secret_value")
+            
+            if not access_key_result.empty:
+                access_key = access_key_result.iloc[0]['SECRET_VALUE']
+                secret_key = secret_key_result.iloc[0]['SECRET_VALUE']
+                region = region_result.iloc[0]['SECRET_VALUE']
+                bucket_name = bucket_result.iloc[0]['SECRET_VALUE']
+                
+                # Cache in session state
+                st.session_state.aws_access_key = access_key
+                st.session_state.aws_secret_key = secret_key
+                st.session_state.aws_region = region
+                st.session_state.aws_bucket_name = bucket_name
+        
+        if access_key and secret_key and bucket_name:
+            return {
+                'access_key': access_key,
+                'secret_key': secret_key,
+                'region': region or 'us-west-2',
+                'bucket_name': bucket_name
+            }
+    except Exception as e:
+        st.error(f"Error accessing Snowflake secrets: {str(e)}")
+    
     # Fallback to environment variables
     return {
         'access_key': os.getenv('AWS_ACCESS_KEY_ID', ''),
@@ -39,48 +80,108 @@ def get_aws_credentials():
         'bucket_name': os.getenv('S3_BUCKET_NAME', '')
     }
 
-def init_s3_client():
-    """Initialize S3 client with credentials"""
-    try:
-        creds = get_aws_credentials()
-        
-        if not all([creds['access_key'], creds['secret_key'], creds['bucket_name']]):
-            st.error("⚠️ AWS credentials not found. Please configure Snowflake secrets or environment variables.")
-            return None, None
-        
-        s3_client = boto3.client(
-            's3',
-            aws_access_key_id=creds['access_key'],
-            aws_secret_access_key=creds['secret_key'],
-            region_name=creds['region']
-        )
-        return s3_client, creds['bucket_name']
-    except Exception as e:
-        st.error(f"Failed to initialize S3 client: {str(e)}")
-        return None, None
-
-def generate_presigned_url(s3_client, bucket_name, object_key, expires_in=3600):
-    """
-    Generate a presigned Amazon S3 URL for PUT operations.
+def generate_aws_signature_v4(method, region, service, access_key, secret_key, url, headers=None, payload=''):
+    """Generate AWS Signature Version 4 for S3 requests"""
+    if headers is None:
+        headers = {}
     
-    :param s3_client: A Boto3 Amazon S3 client.
+    # Parse URL
+    parsed_url = urllib.parse.urlparse(url)
+    host = parsed_url.netloc
+    path = parsed_url.path
+    query = parsed_url.query
+    
+    # Create canonical request
+    canonical_uri = quote(path, safe='/')
+    canonical_querystring = query
+    canonical_headers = '\n'.join([f"{k.lower()}:{v}" for k, v in sorted(headers.items())]) + '\n'
+    signed_headers = ';'.join([k.lower() for k in sorted(headers.keys())])
+    payload_hash = hashlib.sha256(payload.encode('utf-8')).hexdigest()
+    
+    canonical_request = f"{method}\n{canonical_uri}\n{canonical_querystring}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
+    
+    # Create string to sign
+    timestamp = datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
+    date = timestamp[:8]
+    credential_scope = f"{date}/{region}/{service}/aws4_request"
+    algorithm = "AWS4-HMAC-SHA256"
+    
+    string_to_sign = f"{algorithm}\n{timestamp}\n{credential_scope}\n{hashlib.sha256(canonical_request.encode('utf-8')).hexdigest()}"
+    
+    # Calculate signature
+    signing_key = get_signing_key(secret_key, date, region, service)
+    signature = hmac.new(signing_key, string_to_sign.encode('utf-8'), hashlib.sha256).hexdigest()
+    
+    return signature, timestamp, credential_scope
+
+def get_signing_key(secret_key, date, region, service):
+    """Generate AWS signing key"""
+    k_date = hmac.new(f"AWS4{secret_key}".encode('utf-8'), date.encode('utf-8'), hashlib.sha256).digest()
+    k_region = hmac.new(k_date, region.encode('utf-8'), hashlib.sha256).digest()
+    k_service = hmac.new(k_region, service.encode('utf-8'), hashlib.sha256).digest()
+    k_signing = hmac.new(k_service, "aws4_request".encode('utf-8'), hashlib.sha256).digest()
+    return k_signing
+
+def generate_presigned_url(bucket_name, object_key, access_key, secret_key, region, expires_in=3600):
+    """
+    Generate a presigned Amazon S3 URL for PUT operations without boto3.
+    
     :param bucket_name: The name of the S3 bucket.
     :param object_key: The key (path and filename) in the S3 bucket.
+    :param access_key: AWS access key ID.
+    :param secret_key: AWS secret access key.
+    :param region: AWS region.
     :param expires_in: The number of seconds the presigned URL is valid for.
     :return: The presigned URL.
     """
     try:
-        url = s3_client.generate_presigned_url(
-            ClientMethod='put_object',
-            Params={
-                'Bucket': bucket_name,
-                'Key': object_key,
-                'ContentType': 'application/octet-stream'
-            },
-            ExpiresIn=expires_in
-        )
-        return url
-    except ClientError as e:
+        # URL encode the object key
+        encoded_key = quote(object_key, safe='')
+        
+        # Create timestamp and expiration
+        timestamp = datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
+        date = timestamp[:8]
+        expires_timestamp = (datetime.utcnow().timestamp() + expires_in)
+        
+        # Build the query parameters
+        credential = f"{access_key}/{date}/{region}/s3/aws4_request"
+        
+        query_params = {
+            'X-Amz-Algorithm': 'AWS4-HMAC-SHA256',
+            'X-Amz-Credential': credential,
+            'X-Amz-Date': timestamp,
+            'X-Amz-Expires': str(expires_in),
+            'X-Amz-SignedHeaders': 'host'
+        }
+        
+        # Build the URL
+        host = f"{bucket_name}.s3.{region}.amazonaws.com"
+        url = f"https://{host}/{encoded_key}"
+        
+        # Create canonical query string
+        canonical_query = '&'.join([f"{k}={quote(str(v), safe='')}" for k, v in sorted(query_params.items())])
+        
+        # Create canonical request
+        canonical_request = f"PUT\n/{encoded_key}\n{canonical_query}\nhost:{host}\n\nhost\nUNSIGNED-PAYLOAD"
+        
+        # Create string to sign
+        credential_scope = f"{date}/{region}/s3/aws4_request"
+        string_to_sign = f"AWS4-HMAC-SHA256\n{timestamp}\n{credential_scope}\n{hashlib.sha256(canonical_request.encode('utf-8')).hexdigest()}"
+        
+        # Calculate signature
+        signing_key = get_signing_key(secret_key, date, region, 's3')
+        signature = hmac.new(signing_key, string_to_sign.encode('utf-8'), hashlib.sha256).hexdigest()
+        
+        # Add signature to query parameters
+        query_params['X-Amz-Signature'] = signature
+        
+        # Build final URL
+        final_query = '&'.join([f"{k}={quote(str(v), safe='')}" for k, v in sorted(query_params.items())])
+        final_url = f"{url}?{final_query}"
+        
+        return final_url
+        
+    except Exception as e:
         st.error(f"Couldn't generate presigned URL: {str(e)}")
         return None
 
@@ -114,9 +215,9 @@ def main():
     st.title("📁 S3 File Uploader")
     st.markdown("Upload your files securely to our S3 storage")
     
-    # Initialize S3 client and get credentials
-    s3_client, bucket_name = init_s3_client()
-    if not s3_client or not bucket_name:
+    # Get AWS credentials
+    creds = get_aws_credentials()
+    if not all([creds['access_key'], creds['secret_key'], creds['bucket_name']]):
         st.info("📋 **Setup Instructions:**")
         st.markdown("""
         **Option 1: Snowflake Secrets (Recommended for Production)**
@@ -180,9 +281,11 @@ def main():
                         with st.spinner(f"Uploading {uploaded_file.name}..."):
                             # Generate presigned URL
                             presigned_url = generate_presigned_url(
-                                s3_client, 
-                                bucket_name, 
-                                file_key
+                                creds['bucket_name'], 
+                                file_key,
+                                creds['access_key'],
+                                creds['secret_key'],
+                                creds['region']
                             )
                             
                             if presigned_url:
@@ -192,7 +295,7 @@ def main():
                                 
                                 if success:
                                     st.success(f"✅ Successfully uploaded {uploaded_file.name}")
-                                    st.info(f"📍 File location: s3://{bucket_name}/{file_key}")
+                                    st.info(f"📍 File location: s3://{creds['bucket_name']}/{file_key}")
                                 else:
                                     st.error(f"❌ Failed to upload {uploaded_file.name}")
         
@@ -214,7 +317,13 @@ def main():
                     file_key = f"uploads/{unique_filename}"
                     
                     # Generate presigned URL and upload
-                    presigned_url = generate_presigned_url(s3_client, bucket_name, file_key)
+                    presigned_url = generate_presigned_url(
+                        creds['bucket_name'], 
+                        file_key,
+                        creds['access_key'],
+                        creds['secret_key'],
+                        creds['region']
+                    )
                     
                     if presigned_url:
                         file_content = uploaded_file.read()
@@ -248,10 +357,9 @@ def main():
         """)
     
     with col2:
-        creds = get_aws_credentials()
         st.info(f"""
         **Storage Details:**
-        - Bucket: `{bucket_name}`
+        - Bucket: `{creds['bucket_name']}`
         - Region: `{creds['region']}`
         - Default folder: `uploads/`
         - File naming: `YYYYMMDD_HHMMSS_ID_filename.ext`
