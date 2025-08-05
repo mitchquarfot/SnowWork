@@ -9,23 +9,26 @@ import hmac
 import urllib.parse
 from urllib.parse import quote
 
-# Load environment variables from .env file for local development
+# AWS Configuration - Replace with your values
+# For local development, create config_local.py with your actual credentials
 try:
-    from dotenv import load_dotenv
-    load_dotenv()
+    from config_local import AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, S3_BUCKET_NAME
 except ImportError:
-    # dotenv not available, skip loading
-    pass
+    # Fallback values - replace these with your actual values or use environment variables
+    AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID", "YOUR_AWS_ACCESS_KEY_ID")
+    AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "YOUR_AWS_SECRET_ACCESS_KEY")
+    AWS_REGION = os.getenv("AWS_REGION", "us-west-2")
+    S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME", "your-bucket-name")
 
 def get_aws_credentials():
     """
     Get AWS credentials with simplified approach.
-    Priority: Session state > Streamlit secrets > Environment variables
+    Priority: Session state > Config/Environment constants > Manual input
     """
     # First, check if credentials are already in session state (from manual input)
     access_key = st.session_state.get('aws_access_key')
     secret_key = st.session_state.get('aws_secret_key')
-    region = st.session_state.get('aws_region', 'us-west-2')
+    region = st.session_state.get('aws_region', AWS_REGION)
     bucket_name = st.session_state.get('aws_bucket_name')
     
     if access_key and secret_key and bucket_name:
@@ -36,24 +39,16 @@ def get_aws_credentials():
             'bucket_name': bucket_name
         }
     
-    # Try to get from Streamlit secrets (local development)
-    try:
-        if hasattr(st, 'secrets') and 'aws' in st.secrets:
-            creds = {
-                'access_key': st.secrets.aws.access_key_id,
-                'secret_key': st.secrets.aws.secret_access_key,
-                'region': st.secrets.aws.region,
-                'bucket_name': st.secrets.aws.bucket_name
-            }
-            if all([creds['access_key'], creds['secret_key'], creds['bucket_name']]):
-                # Cache in session state
-                st.session_state.aws_access_key = creds['access_key']
-                st.session_state.aws_secret_key = creds['secret_key']
-                st.session_state.aws_region = creds['region']
-                st.session_state.aws_bucket_name = creds['bucket_name']
-                return creds
-    except Exception:
-        pass
+    # Try to use configured constants (from config_local.py or environment)
+    if (AWS_ACCESS_KEY_ID != "YOUR_AWS_ACCESS_KEY_ID" and 
+        AWS_SECRET_ACCESS_KEY != "YOUR_AWS_SECRET_ACCESS_KEY" and 
+        S3_BUCKET_NAME != "your-bucket-name"):
+        return {
+            'access_key': AWS_ACCESS_KEY_ID,
+            'secret_key': AWS_SECRET_ACCESS_KEY,
+            'region': AWS_REGION,
+            'bucket_name': S3_BUCKET_NAME
+        }
     
     # Try environment variables (local development fallback)
     env_creds = {
@@ -240,12 +235,84 @@ def main():
     # File upload section
     st.header("Upload Files")
     
-    # File uploader
-    uploaded_files = st.file_uploader(
-        "Choose files to upload",
-        accept_multiple_files=True,
-        help="Select one or more files to upload to S3"
-    )
+    # Check Streamlit version and provide appropriate interface
+    streamlit_version = st.__version__
+    version_parts = [int(x) for x in streamlit_version.split('.')]
+    has_file_uploader = (version_parts[0] > 1) or (version_parts[0] == 1 and version_parts[1] >= 26)
+    
+    if has_file_uploader:
+        # Modern file uploader (Streamlit 1.26+)
+        uploaded_files = st.file_uploader(
+            "Choose files to upload",
+            accept_multiple_files=True,
+            help="Select one or more files to upload to S3"
+        )
+    else:
+        # Fallback for older Streamlit versions
+        st.info("📁 **File Upload Instructions:**")
+        st.markdown(f"""
+        Since you're using Streamlit version {streamlit_version} (requires 1.26+), please use the text input method below:
+        """)
+        
+        # Alternative method: text input for file content
+        st.subheader("Text Content Upload")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            filename = st.text_input("Enter filename (with extension):", placeholder="example.csv")
+        with col2:
+            file_path = st.text_input("S3 path (optional):", placeholder="folder/subfolder/")
+        
+        file_content_text = st.text_area(
+            "Paste your file content here:",
+            height=200,
+            help="Copy and paste the content of your file here"
+        )
+        
+        uploaded_files = None
+        
+        if st.button("Upload Text Content", type="primary") and filename and file_content_text:
+            # Convert text to bytes
+            file_content = file_content_text.encode('utf-8')
+            
+            # Generate file key
+            if file_path:
+                file_key = f"{file_path.rstrip('/')}/{filename}"
+            else:
+                unique_filename = generate_unique_filename(filename)
+                file_key = f"uploads/{unique_filename}"
+            
+            # Upload the content
+            with st.spinner(f"Uploading {filename}..."):
+                credentials = get_aws_credentials()
+                presigned_url = generate_presigned_url(
+                    credentials['bucket_name'], 
+                    file_key,
+                    credentials['access_key'],
+                    credentials['secret_key'],
+                    credentials['region']
+                )
+                
+                if presigned_url:
+                    success = upload_file_to_s3(presigned_url, file_content)
+                    
+                    if success:
+                        st.success(f"✅ Successfully uploaded {filename}")
+                        st.info(f"📍 File location: s3://{credentials['bucket_name']}/{file_key}")
+                    else:
+                        st.error(f"❌ Failed to upload {filename}")
+        
+        # Show upgrade recommendation
+        st.markdown("---")
+        st.subheader("🔧 For Full File Upload Functionality")
+        st.info(f"""
+        **Recommended**: Ask your administrator to upgrade Snowflake Streamlit to version 1.26+ 
+        to enable drag-and-drop file uploads.
+        
+        **Current version**: {streamlit_version}  
+        **Required version**: 1.26.0+
+        """)
+        return  # Exit early for older versions
     
     if uploaded_files:
         st.subheader("Files to Upload:")
