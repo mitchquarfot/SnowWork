@@ -36,7 +36,7 @@ def get_aws_credentials():
     
     # Try to get from Snowflake database secrets using SQL
     try:
-        # This will work when running in Snowflake Streamlit
+        # Check session state cache first
         access_key = st.session_state.get('aws_access_key')
         secret_key = st.session_state.get('aws_secret_key')
         region = st.session_state.get('aws_region')
@@ -44,23 +44,62 @@ def get_aws_credentials():
         
         if not access_key:
             # Try to fetch from Snowflake secrets using SQL
-            conn = st.connection("snowflake")
-            access_key_result = conn.query("SELECT SYSTEM$GET_SECRET_STRING('aws_access_key_id') as secret_value")
-            secret_key_result = conn.query("SELECT SYSTEM$GET_SECRET_STRING('aws_secret_access_key') as secret_value")
-            region_result = conn.query("SELECT SYSTEM$GET_SECRET_STRING('aws_region') as secret_value")
-            bucket_result = conn.query("SELECT SYSTEM$GET_SECRET_STRING('s3_bucket_name') as secret_value")
-            
-            if not access_key_result.empty:
-                access_key = access_key_result.iloc[0]['SECRET_VALUE']
-                secret_key = secret_key_result.iloc[0]['SECRET_VALUE']
-                region = region_result.iloc[0]['SECRET_VALUE']
-                bucket_name = bucket_result.iloc[0]['SECRET_VALUE']
+            try:
+                # Use experimental_connection for older Streamlit versions in Snowflake
+                if hasattr(st, 'experimental_connection'):
+                    conn = st.experimental_connection("snowflake")
+                elif hasattr(st, 'connection'):
+                    conn = st.connection("snowflake")
+                else:
+                    # Fallback: assume we're in Snowflake and use direct SQL execution
+                    # This will be handled by the exception block
+                    raise AttributeError("No connection method available")
                 
-                # Cache in session state
-                st.session_state.aws_access_key = access_key
-                st.session_state.aws_secret_key = secret_key
-                st.session_state.aws_region = region
-                st.session_state.aws_bucket_name = bucket_name
+                access_key_result = conn.query("SELECT SYSTEM$GET_SECRET_STRING('aws_access_key_id') as secret_value", ttl=3600)
+                secret_key_result = conn.query("SELECT SYSTEM$GET_SECRET_STRING('aws_secret_access_key') as secret_value", ttl=3600)
+                region_result = conn.query("SELECT SYSTEM$GET_SECRET_STRING('aws_region') as secret_value", ttl=3600)
+                bucket_result = conn.query("SELECT SYSTEM$GET_SECRET_STRING('s3_bucket_name') as secret_value", ttl=3600)
+                
+                if not access_key_result.empty:
+                    access_key = access_key_result.iloc[0]['SECRET_VALUE']
+                    secret_key = secret_key_result.iloc[0]['SECRET_VALUE']
+                    region = region_result.iloc[0]['SECRET_VALUE']
+                    bucket_name = bucket_result.iloc[0]['SECRET_VALUE']
+                    
+                    # Cache in session state
+                    st.session_state.aws_access_key = access_key
+                    st.session_state.aws_secret_key = secret_key
+                    st.session_state.aws_region = region
+                    st.session_state.aws_bucket_name = bucket_name
+                    
+            except Exception as conn_error:
+                # If connection methods don't work, try using snowflake.snowpark.context
+                try:
+                    import snowflake.snowpark.context as ctx
+                    session = ctx.get_active_session()
+                    
+                    access_key_result = session.sql("SELECT SYSTEM$GET_SECRET_STRING('aws_access_key_id') as secret_value").collect()
+                    secret_key_result = session.sql("SELECT SYSTEM$GET_SECRET_STRING('aws_secret_access_key') as secret_value").collect()
+                    region_result = session.sql("SELECT SYSTEM$GET_SECRET_STRING('aws_region') as secret_value").collect()
+                    bucket_result = session.sql("SELECT SYSTEM$GET_SECRET_STRING('s3_bucket_name') as secret_value").collect()
+                    
+                    if access_key_result:
+                        access_key = access_key_result[0]['SECRET_VALUE']
+                        secret_key = secret_key_result[0]['SECRET_VALUE']
+                        region = region_result[0]['SECRET_VALUE']
+                        bucket_name = bucket_result[0]['SECRET_VALUE']
+                        
+                        # Cache in session state
+                        st.session_state.aws_access_key = access_key
+                        st.session_state.aws_secret_key = secret_key
+                        st.session_state.aws_region = region
+                        st.session_state.aws_bucket_name = bucket_name
+                        
+                except Exception as snowpark_error:
+                    # If all else fails, show a helpful message but don't crash
+                    st.warning(f"Could not access Snowflake secrets automatically. Please configure manually or contact administrator.")
+                    st.info(f"Connection error: {str(conn_error)}")
+                    st.info(f"Snowpark error: {str(snowpark_error)}")
         
         if access_key and secret_key and bucket_name:
             return {
@@ -70,7 +109,7 @@ def get_aws_credentials():
                 'bucket_name': bucket_name
             }
     except Exception as e:
-        st.error(f"Error accessing Snowflake secrets: {str(e)}")
+        st.warning(f"Error accessing Snowflake secrets: {str(e)}")
     
     # Fallback to environment variables
     return {
@@ -218,26 +257,62 @@ def main():
     # Get AWS credentials
     creds = get_aws_credentials()
     if not all([creds['access_key'], creds['secret_key'], creds['bucket_name']]):
-        st.info("📋 **Setup Instructions:**")
+        st.warning("⚠️ AWS credentials not configured automatically.")
+        
+        # Manual credential input as fallback
+        st.subheader("🔑 Manual Credential Configuration")
+        
+        with st.expander("Enter AWS Credentials", expanded=True):
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                manual_access_key = st.text_input("AWS Access Key ID", type="password", key="manual_access_key")
+                manual_region = st.selectbox("AWS Region", ["us-west-2", "us-east-1", "us-west-1", "eu-west-1", "eu-central-1"], key="manual_region")
+            
+            with col2:
+                manual_secret_key = st.text_input("AWS Secret Access Key", type="password", key="manual_secret_key")
+                manual_bucket = st.text_input("S3 Bucket Name", value="mquarfot-dev", key="manual_bucket")
+            
+            if st.button("Use These Credentials", type="primary"):
+                if all([manual_access_key, manual_secret_key, manual_bucket]):
+                    # Store in session state
+                    st.session_state.aws_access_key = manual_access_key
+                    st.session_state.aws_secret_key = manual_secret_key
+                    st.session_state.aws_region = manual_region
+                    st.session_state.aws_bucket_name = manual_bucket
+                    st.success("✅ Credentials saved for this session!")
+                    st.rerun()
+                else:
+                    st.error("❌ Please fill in all credential fields")
+        
+        st.info("📋 **For Production Setup:**")
         st.markdown("""
-        **Option 1: Snowflake Secrets (Recommended for Production)**
+        **Snowflake Secrets (Recommended)**
         ```sql
-        CREATE SECRET aws_credentials
-        TYPE = GENERIC
-        SECRET_STRING = '{
-            "access_key_id": "your-access-key",
-            "secret_access_key": "your-secret-key",
-            "region": "us-west-2",
-            "bucket_name": "your-bucket-name"
-        }';
+        CREATE OR REPLACE SECRET aws_access_key_id
+        TYPE = GENERIC_STRING
+        SECRET_STRING = 'your-access-key-id';
+        
+        CREATE OR REPLACE SECRET aws_secret_access_key
+        TYPE = GENERIC_STRING
+        SECRET_STRING = 'your-secret-access-key';
+        
+        CREATE OR REPLACE SECRET aws_region
+        TYPE = GENERIC_STRING
+        SECRET_STRING = 'us-west-2';
+        
+        CREATE OR REPLACE SECRET s3_bucket_name
+        TYPE = GENERIC_STRING
+        SECRET_STRING = 'your-bucket-name';
         ```
         
-        **Option 2: Environment Variables (Local Development)**
-        Set these environment variables before running the app:
-        - `AWS_ACCESS_KEY_ID`
-        - `AWS_SECRET_ACCESS_KEY`
-        - `AWS_REGION`
-        - `S3_BUCKET_NAME`
+        **Grant Permissions:**
+        ```sql
+        GRANT USAGE ON SECRET aws_access_key_id TO ROLE YOUR_ROLE;
+        GRANT USAGE ON SECRET aws_secret_access_key TO ROLE YOUR_ROLE;
+        GRANT USAGE ON SECRET aws_region TO ROLE YOUR_ROLE;
+        GRANT USAGE ON SECRET s3_bucket_name TO ROLE YOUR_ROLE;
+        ```
         """)
         return
     
