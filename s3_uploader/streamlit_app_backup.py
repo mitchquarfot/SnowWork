@@ -19,65 +19,157 @@ except ImportError:
 
 def get_aws_credentials():
     """
-    Get AWS credentials with simplified approach.
-    Priority: Session state > Streamlit secrets > Environment variables
+    Get AWS credentials from Snowflake secrets or environment variables.
+    Priority: Snowflake secrets > Environment variables > Default values
     """
-    # First, check if credentials are already in session state (from manual input)
-    access_key = st.session_state.get('aws_access_key')
-    secret_key = st.session_state.get('aws_secret_key')
-    region = st.session_state.get('aws_region', 'us-west-2')
-    bucket_name = st.session_state.get('aws_bucket_name')
-    
-    if access_key and secret_key and bucket_name:
-        return {
-            'access_key': access_key,
-            'secret_key': secret_key,
-            'region': region,
-            'bucket_name': bucket_name
-        }
-    
-    # Try to get from Streamlit secrets (local development)
     try:
+        # Try to get from Snowflake secrets first (recommended for production)
         if hasattr(st, 'secrets') and 'aws' in st.secrets:
-            creds = {
+            return {
                 'access_key': st.secrets.aws.access_key_id,
                 'secret_key': st.secrets.aws.secret_access_key,
                 'region': st.secrets.aws.region,
                 'bucket_name': st.secrets.aws.bucket_name
             }
-            if all([creds['access_key'], creds['secret_key'], creds['bucket_name']]):
-                # Cache in session state
-                st.session_state.aws_access_key = creds['access_key']
-                st.session_state.aws_secret_key = creds['secret_key']
-                st.session_state.aws_region = creds['region']
-                st.session_state.aws_bucket_name = creds['bucket_name']
-                return creds
     except Exception:
         pass
     
-    # Try environment variables (local development fallback)
-    env_creds = {
+    # Try to get from Snowflake database secrets using SQL
+    try:
+        # Check session state cache first
+        access_key = st.session_state.get('aws_access_key')
+        secret_key = st.session_state.get('aws_secret_key')
+        region = st.session_state.get('aws_region')
+        bucket_name = st.session_state.get('aws_bucket_name')
+        
+        if not access_key:
+            # Try to fetch from Snowflake secrets using SQL
+            try:
+                # Use experimental_connection for older Streamlit versions in Snowflake
+                if hasattr(st, 'experimental_connection'):
+                    conn = st.experimental_connection("snowflake")
+                elif hasattr(st, 'connection'):
+                    conn = st.connection("snowflake")
+                else:
+                    # Fallback: assume we're in Snowflake and use direct SQL execution
+                    # This will be handled by the exception block
+                    raise AttributeError("No connection method available")
+                
+                                    # Try to get current database/schema context first
+                    try:
+                        current_db = conn.query("SELECT CURRENT_DATABASE() as db_name", ttl=300)
+                        if current_db.empty or current_db.iloc[0]['DB_NAME'] is None:
+                            # Try to use a default database context
+                            conn.query("USE DATABASE INFORMATION_SCHEMA", ttl=300)
+                    except:
+                        pass  # Continue even if we can't set database context
+                    
+                    access_key_result = conn.query("SELECT SYSTEM$GET_SECRET_STRING('aws_access_key_id') as secret_value", ttl=3600)
+                    secret_key_result = conn.query("SELECT SYSTEM$GET_SECRET_STRING('aws_secret_access_key') as secret_value", ttl=3600)
+                    region_result = conn.query("SELECT SYSTEM$GET_SECRET_STRING('aws_region') as secret_value", ttl=3600)
+                    bucket_result = conn.query("SELECT SYSTEM$GET_SECRET_STRING('s3_bucket_name') as secret_value", ttl=3600)
+                
+                if not access_key_result.empty:
+                    access_key = access_key_result.iloc[0]['SECRET_VALUE']
+                    secret_key = secret_key_result.iloc[0]['SECRET_VALUE']
+                    region = region_result.iloc[0]['SECRET_VALUE']
+                    bucket_name = bucket_result.iloc[0]['SECRET_VALUE']
+                    
+                    # Cache in session state
+                    st.session_state.aws_access_key = access_key
+                    st.session_state.aws_secret_key = secret_key
+                    st.session_state.aws_region = region
+                    st.session_state.aws_bucket_name = bucket_name
+                    
+                            except Exception as conn_error:
+                # If connection methods don't work, try using snowflake.snowpark.context
+                try:
+                    import snowflake.snowpark.context as ctx
+                    session = ctx.get_active_session()
+                    
+                    # Try to set database context if needed
+                    try:
+                        current_db_result = session.sql("SELECT CURRENT_DATABASE() as db_name").collect()
+                        if not current_db_result or current_db_result[0]['DB_NAME'] is None:
+                            # Try to use INFORMATION_SCHEMA as fallback
+                            session.sql("USE DATABASE INFORMATION_SCHEMA").collect()
+                    except:
+                        pass  # Continue even if we can't set database context
+                    
+                    access_key_result = session.sql("SELECT SYSTEM$GET_SECRET_STRING('aws_access_key_id') as secret_value").collect()
+                    secret_key_result = session.sql("SELECT SYSTEM$GET_SECRET_STRING('aws_secret_access_key') as secret_value").collect()
+                    region_result = session.sql("SELECT SYSTEM$GET_SECRET_STRING('aws_region') as secret_value").collect()
+                    bucket_result = session.sql("SELECT SYSTEM$GET_SECRET_STRING('s3_bucket_name') as secret_value").collect()
+                    
+                    if access_key_result:
+                        access_key = access_key_result[0]['SECRET_VALUE']
+                        secret_key = secret_key_result[0]['SECRET_VALUE']
+                        region = region_result[0]['SECRET_VALUE']
+                        bucket_name = bucket_result[0]['SECRET_VALUE']
+                        
+                        # Cache in session state
+                        st.session_state.aws_access_key = access_key
+                        st.session_state.aws_secret_key = secret_key
+                        st.session_state.aws_region = region
+                        st.session_state.aws_bucket_name = bucket_name
+                        
+                except Exception as snowpark_error:
+                    # If all else fails, show a helpful message but don't crash
+                    st.warning(f"Could not access Snowflake secrets automatically. Please configure manually or contact administrator.")
+                    st.info(f"Connection error: {str(conn_error)}")
+                    st.info(f"Snowpark error: {str(snowpark_error)}")
+        
+        if access_key and secret_key and bucket_name:
+            return {
+                'access_key': access_key,
+                'secret_key': secret_key,
+                'region': region or 'us-west-2',
+                'bucket_name': bucket_name
+            }
+    except Exception as e:
+        st.warning(f"Error accessing Snowflake secrets: {str(e)}")
+    
+    # Fallback to environment variables
+    return {
         'access_key': os.getenv('AWS_ACCESS_KEY_ID', ''),
         'secret_key': os.getenv('AWS_SECRET_ACCESS_KEY', ''),
         'region': os.getenv('AWS_REGION', 'us-west-2'),
         'bucket_name': os.getenv('S3_BUCKET_NAME', '')
     }
+
+def generate_aws_signature_v4(method, region, service, access_key, secret_key, url, headers=None, payload=''):
+    """Generate AWS Signature Version 4 for S3 requests"""
+    if headers is None:
+        headers = {}
     
-    if all([env_creds['access_key'], env_creds['secret_key'], env_creds['bucket_name']]):
-        # Cache in session state
-        st.session_state.aws_access_key = env_creds['access_key']
-        st.session_state.aws_secret_key = env_creds['secret_key']
-        st.session_state.aws_region = env_creds['region']
-        st.session_state.aws_bucket_name = env_creds['bucket_name']
-        return env_creds
+    # Parse URL
+    parsed_url = urllib.parse.urlparse(url)
+    host = parsed_url.netloc
+    path = parsed_url.path
+    query = parsed_url.query
     
-    # Return empty credentials (will trigger manual input)
-    return {
-        'access_key': '',
-        'secret_key': '',
-        'region': 'us-west-2',
-        'bucket_name': ''
-    }
+    # Create canonical request
+    canonical_uri = quote(path, safe='/')
+    canonical_querystring = query
+    canonical_headers = '\n'.join([f"{k.lower()}:{v}" for k, v in sorted(headers.items())]) + '\n'
+    signed_headers = ';'.join([k.lower() for k in sorted(headers.keys())])
+    payload_hash = hashlib.sha256(payload.encode('utf-8')).hexdigest()
+    
+    canonical_request = f"{method}\n{canonical_uri}\n{canonical_querystring}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
+    
+    # Create string to sign
+    timestamp = datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
+    date = timestamp[:8]
+    credential_scope = f"{date}/{region}/{service}/aws4_request"
+    algorithm = "AWS4-HMAC-SHA256"
+    
+    string_to_sign = f"{algorithm}\n{timestamp}\n{credential_scope}\n{hashlib.sha256(canonical_request.encode('utf-8')).hexdigest()}"
+    
+    # Calculate signature
+    signing_key = get_signing_key(secret_key, date, region, service)
+    signature = hmac.new(signing_key, string_to_sign.encode('utf-8'), hashlib.sha256).hexdigest()
+    
+    return signature, timestamp, credential_scope
 
 def get_signing_key(secret_key, date, region, service):
     """Generate AWS signing key"""
@@ -90,6 +182,14 @@ def get_signing_key(secret_key, date, region, service):
 def generate_presigned_url(bucket_name, object_key, access_key, secret_key, region, expires_in=3600):
     """
     Generate a presigned Amazon S3 URL for PUT operations without boto3.
+    
+    :param bucket_name: The name of the S3 bucket.
+    :param object_key: The key (path and filename) in the S3 bucket.
+    :param access_key: AWS access key ID.
+    :param secret_key: AWS secret access key.
+    :param region: AWS region.
+    :param expires_in: The number of seconds the presigned URL is valid for.
+    :return: The presigned URL.
     """
     try:
         # URL encode the object key
@@ -98,6 +198,7 @@ def generate_presigned_url(bucket_name, object_key, access_key, secret_key, regi
         # Create timestamp and expiration
         timestamp = datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
         date = timestamp[:8]
+        expires_timestamp = (datetime.utcnow().timestamp() + expires_in)
         
         # Build the query parameters
         credential = f"{access_key}/{date}/{region}/s3/aws4_request"
@@ -174,12 +275,12 @@ def main():
     # Get AWS credentials
     creds = get_aws_credentials()
     if not all([creds['access_key'], creds['secret_key'], creds['bucket_name']]):
-        st.warning("⚠️ AWS credentials not configured.")
+        st.warning("⚠️ AWS credentials not configured automatically.")
         
-        # Manual credential input
-        st.subheader("🔑 Enter AWS Credentials")
+        # Manual credential input as fallback
+        st.subheader("🔑 Manual Credential Configuration")
         
-        with st.expander("AWS Configuration", expanded=True):
+        with st.expander("Enter AWS Credentials", expanded=True):
             col1, col2 = st.columns(2)
             
             with col1:
@@ -190,7 +291,7 @@ def main():
                 manual_secret_key = st.text_input("AWS Secret Access Key", type="password", key="manual_secret_key")
                 manual_bucket = st.text_input("S3 Bucket Name", value="mquarfot-dev", key="manual_bucket")
             
-            if st.button("Save Credentials", type="primary"):
+            if st.button("Use These Credentials", type="primary"):
                 if all([manual_access_key, manual_secret_key, manual_bucket]):
                     # Store in session state
                     st.session_state.aws_access_key = manual_access_key
@@ -202,40 +303,36 @@ def main():
                 else:
                     st.error("❌ Please fill in all credential fields")
         
-        # Show setup instructions
-        with st.expander("📋 Production Setup Instructions"):
-            st.markdown("""
-            **For Production - Snowflake Secrets (Recommended):**
-            ```sql
-            CREATE OR REPLACE SECRET aws_access_key_id
-            TYPE = GENERIC_STRING
-            SECRET_STRING = 'your-access-key-id';
-            
-            CREATE OR REPLACE SECRET aws_secret_access_key
-            TYPE = GENERIC_STRING
-            SECRET_STRING = 'your-secret-access-key';
-            
-            CREATE OR REPLACE SECRET aws_region
-            TYPE = GENERIC_STRING
-            SECRET_STRING = 'us-west-2';
-            
-            CREATE OR REPLACE SECRET s3_bucket_name
-            TYPE = GENERIC_STRING
-            SECRET_STRING = 'your-bucket-name';
-            ```
-            
-            **Grant Permissions:**
-            ```sql
-            GRANT USAGE ON SECRET aws_access_key_id TO ROLE YOUR_ROLE;
-            GRANT USAGE ON SECRET aws_secret_access_key TO ROLE YOUR_ROLE;
-            GRANT USAGE ON SECRET aws_region TO ROLE YOUR_ROLE;
-            GRANT USAGE ON SECRET s3_bucket_name TO ROLE YOUR_ROLE;
-            ```
-            """)
+        st.info("📋 **For Production Setup:**")
+        st.markdown("""
+        **Snowflake Secrets (Recommended)**
+        ```sql
+        CREATE OR REPLACE SECRET aws_access_key_id
+        TYPE = GENERIC_STRING
+        SECRET_STRING = 'your-access-key-id';
+        
+        CREATE OR REPLACE SECRET aws_secret_access_key
+        TYPE = GENERIC_STRING
+        SECRET_STRING = 'your-secret-access-key';
+        
+        CREATE OR REPLACE SECRET aws_region
+        TYPE = GENERIC_STRING
+        SECRET_STRING = 'us-west-2';
+        
+        CREATE OR REPLACE SECRET s3_bucket_name
+        TYPE = GENERIC_STRING
+        SECRET_STRING = 'your-bucket-name';
+        ```
+        
+        **Grant Permissions:**
+        ```sql
+        GRANT USAGE ON SECRET aws_access_key_id TO ROLE YOUR_ROLE;
+        GRANT USAGE ON SECRET aws_secret_access_key TO ROLE YOUR_ROLE;
+        GRANT USAGE ON SECRET aws_region TO ROLE YOUR_ROLE;
+        GRANT USAGE ON SECRET s3_bucket_name TO ROLE YOUR_ROLE;
+        ```
+        """)
         return
-    
-    # Show current configuration
-    st.info(f"✅ Connected to S3 bucket: `{creds['bucket_name']}` in region `{creds['region']}`")
     
     # File upload section
     st.header("Upload Files")
